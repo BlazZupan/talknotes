@@ -31,7 +31,7 @@ You need Python 3 and pip. From the project folder:
 python -m pip install -r requirements.txt
 ```
 
-That installs PySide6 (the window), markdown-it-py, pygments, and pynput.
+That installs PySide6 (the window), markdown-it-py, mdit-py-plugins, pygments, and pynput.
 
 Global shortcuts (`⌘⌃` plus arrows) are macOS. The window itself is a Qt app and may run on other systems.
 
@@ -47,9 +47,20 @@ If you pass a directory, Talknotes opens `directory/directory.md` when that file
 How a notes file is structured:
 
 - `# Heading` starts a new slide; `##` and `###` are headings on that slide.
-- Ordinary Markdown works: lists, tables, links, fenced code, and images next to the file (`![](photo.jpg)`).
+- Ordinary Markdown works: lists, tables, links, fenced code, images next to the file (`![](photo.jpg)`), and LaTeX math (`$...$` or `\(...\)` inline, `$$...$$` or `\[...\]` display).
 - Quoted blocks (`>`) can be copied to the clipboard.
-- Click an image to open it in its own window.
+- Click an image, or a link to an image file (`[map](map.webp)`), to open it in its own title-less window. Drag the image to move the window, drag the edges to resize it, and click it or press Escape to close it. PNG, JPEG, GIF, WebP, SVG, and BMP are supported.
+- Galleries open several images in one window, browsed with `←` / `→` (`↑` / `↓` for the first / last image). Link to a folder to show all its images in filename order, or list the images after `gallery:` (folders in the list add all their images):
+
+  `[Slovenia by bike](slovenia/)`  
+  `[Highlights](<gallery: soca.jpg ../maps/route.webp photos/>)`
+
+  To show one image on the slide and keep the rest behind it, wrap the image in a gallery link. The image gets a small "+N" badge for the other images, and clicking it opens the gallery at that image (it is added first if it is not in the list):
+
+  `[![](map-ljubljana.webp)](<gallery: map-bled.jpg map-piran.jpg>)`
+- Prefix a link with `run:` to launch a local command when clicked (use angle brackets if the command contains spaces):
+
+  `[Logistic regression](<run:python /path/to/app.py>)`
 
 ## Keyboard shortcuts
 
@@ -63,14 +74,15 @@ With the Talknotes window focused:
 | Shift + `+` / `−` | increase / decrease text size |
 | `[` / `]` | decrease / increase quoted text size |
 | `c` | copy all quoted markdown |
-| `m` then 1–9 | copy the *n*-th quoted block |
+| `m` then 1–9 | copy the *n*-th quoted or code block |
 | `e` | open the markdown file in the default editor |
-| `r` | reload the markdown file |
+| `r` / `R` | reload the markdown file |
 | `d` | toggle dark mode |
 | `p` | toggle page numbers |
 | `t` | toggle window frame / title bar |
 | Option + drag | move the window (frameless mode) |
-| click image | open the image in a movable, resizable window |
+| click image / image link | open the image in a title-less, movable, resizable window (click or Esc closes it) |
+| `←` / `→` in an image window | previous / next image of a gallery |
 | `h` / `?` / Escape | show / hide this help |
 
 While another app is focused (macOS):
@@ -90,6 +102,8 @@ Talknotes comes with examples, try them out:
   `python talknotes.py examples/orange`
 - **[examples/cycling](examples/cycling)** — another simple image-heavy example with notes on Slovenia and cycling. Try clicking on any of the photos in the notes.
   `python talknotes.py examples/cycling`
+- **[examples/gallery](examples/gallery)** — image galleries: a link to a folder of WebP photos, a hand-picked `gallery:` list, and images on the slide with a "+N" badge for the images behind them. Click a link, then browse with the arrow keys.  
+  `python talknotes.py examples/gallery`
 - **[examples/markdown](examples/markdown)** — demos Markdown elements (text, tables, code).  
   `python talknotes.py examples/markdown`
 - **[examples/copy-quotes](examples/copy-quotes)** — demos the use of quotes that one can copy to the clipboard (using `c`, or `m` then 1–9).  

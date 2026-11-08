@@ -1,4 +1,5 @@
 PySide6
 markdown-it-py
+mdit-py-plugins
 pygments
 pynput

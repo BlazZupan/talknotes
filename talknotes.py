@@ -1,7 +1,7 @@
 #!/usr/bin/env /opt/miniconda3/envs/orange/bin/python
 #
 # Setup:
-#   python -m pip install PySide6 markdown-it-py pygments pynput
+#   python -m pip install PySide6 markdown-it-py mdit-py-plugins pygments pynput
 #
 # Usage:
 #   python talknotes.py path/to/slides.md
@@ -16,8 +16,12 @@ import argparse
 import hashlib
 import html
 import re
+import shlex
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from urllib.parse import unquote
 from typing import Any
 
 try:
@@ -25,7 +29,19 @@ try:
 except ImportError as exc:
     print(
         "Missing dependency: markdown-it-py. Install it with:\n"
-        "  python -m pip install PySide6 markdown-it-py pygments pynput",
+        "  python -m pip install PySide6 markdown-it-py mdit-py-plugins pygments pynput",
+        file=sys.stderr,
+    )
+    raise SystemExit(1) from exc
+
+try:
+    from markdown_it.rules_block import StateBlock
+    from markdown_it.rules_inline import StateInline
+    from mdit_py_plugins.dollarmath import dollarmath_plugin
+except ImportError as exc:
+    print(
+        "Missing dependency: mdit-py-plugins. Install it with:\n"
+        "  python -m pip install PySide6 markdown-it-py mdit-py-plugins pygments pynput",
         file=sys.stderr,
     )
     raise SystemExit(1) from exc
@@ -38,7 +54,7 @@ try:
 except ImportError as exc:
     print(
         "Missing dependency: pygments. Install it with:\n"
-        "  python -m pip install PySide6 markdown-it-py pygments pynput",
+        "  python -m pip install PySide6 markdown-it-py mdit-py-plugins pygments pynput",
         file=sys.stderr,
     )
     raise SystemExit(1) from exc
@@ -60,12 +76,14 @@ try:
     )
     from PySide6.QtGui import (
         QCloseEvent,
+        QColor,
         QCursor,
         QDesktopServices,
         QImageReader,
         QKeyEvent,
         QKeySequence,
         QMouseEvent,
+        QPaintEvent,
         QPainter,
         QPixmap,
         QResizeEvent,
@@ -74,17 +92,15 @@ try:
     )
     from PySide6.QtWidgets import (
         QApplication,
-        QLabel,
         QMainWindow,
-        QScrollArea,
-        QSizePolicy,
+        QWidget,
     )
     from PySide6.QtWebEngineCore import QWebEnginePage
     from PySide6.QtWebEngineWidgets import QWebEngineView
 except ImportError as exc:
     print(
         "Missing dependency: PySide6 with Qt WebEngine. Install it with:\n"
-        "  python -m pip install PySide6 markdown-it-py pygments pynput",
+        "  python -m pip install PySide6 markdown-it-py mdit-py-plugins pygments pynput",
         file=sys.stderr,
     )
     raise SystemExit(1) from exc
@@ -102,6 +118,7 @@ except ImportError:
 
 TOP_LEVEL_HEADING = re.compile(r"^#(?!#)(?:\s+|$)")
 BLOCKQUOTE_PREFIX = re.compile(r"^>\s?")
+FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 BR_TAG = re.compile(r"<br\s*/?>", re.IGNORECASE)
 HTML_LINK = re.compile(
     r"""<a\s+[^>]*href=(['"])(.*?)\1[^>]*>(.*?)</a>""",
@@ -133,7 +150,19 @@ HTML_IMG_TAG = re.compile(
     r"""<img\b[^>]*\ssrc=(['"])(.*?)\1[^>]*>""",
     re.IGNORECASE,
 )
+HTML_ANCHOR_ELEMENT = re.compile(r"<a\b[^>]*>.*?</a>", re.IGNORECASE | re.DOTALL)
+# An <a> whose only content is an <img>. The href must not run past its
+# closing quote, or a text link could swallow a later image link.
+HTML_IMAGE_ANCHOR = re.compile(
+    r"""<a\b[^>]*\shref=(?:"([^"]*)"|'([^']*)')[^>]*>\s*(<img\b[^>]*>)\s*</a>""",
+    re.IGNORECASE,
+)
 EXTERNAL_HREF_PREFIXES = ("http://", "https://", "mailto:", "talknotes:", "javascript:", "#")
+RUN_HREF_PREFIX = "run:"
+GALLERY_HREF_PREFIX = "gallery:"
+KATEX_DIR = Path(__file__).resolve().parent / "vendor" / "katex"
+BRACKET_MATH_INLINE_RE = re.compile(r"\\\((.+?)\\\)", re.DOTALL)
+BRACKET_MATH_BLOCK_RE = re.compile(r"\\\[([\s\S]+?)\\\]")
 
 
 def split_slides(markdown_text: str) -> list[str]:
@@ -201,20 +230,71 @@ def extract_quoted_blocks(slide_markdown: str) -> list[str]:
     return blocks
 
 
+def extract_copyable_blocks(slide_markdown: str) -> list[str]:
+    """Return blockquotes and fenced code blocks from a slide, in order.
+
+    Code blocks are returned as raw code, without the fence lines.
+    """
+    blocks: list[str] = []
+    quote_block: list[str] | None = None
+    fence_close: re.Pattern[str] | None = None
+    code_lines: list[str] = []
+
+    def finish_quote() -> None:
+        nonlocal quote_block
+        if quote_block is not None:
+            finalized = _finalize_quoted_block(quote_block)
+            if finalized is not None:
+                blocks.append(finalized)
+            quote_block = None
+
+    for line in slide_markdown.splitlines():
+        if fence_close is not None:
+            if fence_close.match(line):
+                blocks.append("\n".join(code_lines))
+                fence_close = None
+            else:
+                code_lines.append(line)
+            continue
+
+        fence_match = FENCE_OPEN.match(line)
+        if fence_match:
+            finish_quote()
+            marker = fence_match.group(1)
+            fence_close = re.compile(
+                rf"^ {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}\s*$"
+            )
+            code_lines = []
+        elif BLOCKQUOTE_PREFIX.match(line):
+            if quote_block is None:
+                quote_block = []
+            quote_block.append(BLOCKQUOTE_PREFIX.sub("", line, count=1))
+        elif quote_block is not None:
+            if line.strip() == "":
+                finish_quote()
+            else:
+                quote_block.append(line)
+
+    finish_quote()
+    if fence_close is not None:
+        blocks.append("\n".join(code_lines))
+    return blocks
+
+
+def extract_nth_copyable_block(slide_markdown: str, index: int) -> str | None:
+    """Return the 1-based quoted or code block from a slide, if it exists."""
+    blocks = extract_copyable_blocks(slide_markdown)
+    if 1 <= index <= len(blocks):
+        return blocks[index - 1]
+    return None
+
+
 def extract_quoted_text(slide_markdown: str) -> str | None:
     """Return all blockquote markdown from a slide."""
     blocks = extract_quoted_blocks(slide_markdown)
     if not blocks:
         return None
     return "\n\n".join(blocks)
-
-
-def extract_nth_quoted_text(slide_markdown: str, index: int) -> str | None:
-    """Return the 1-based blockquote block from a slide, if it exists."""
-    blocks = extract_quoted_blocks(slide_markdown)
-    if 1 <= index <= len(blocks):
-        return blocks[index - 1]
-    return None
 
 
 def highlight_code(code: str, language: str, _attrs: str = "") -> str:
@@ -226,11 +306,82 @@ def highlight_code(code: str, language: str, _attrs: str = "") -> str:
 
     formatter = HtmlFormatter(nowrap=True)
     highlighted = highlight(code, lexer, formatter)
-    return f'<pre class="code-block"><code>{highlighted}</code></pre>'
+    return f'<pre class="code-block highlight"><code>{highlighted}</code></pre>'
+
+
+def katex_asset_url(name: str) -> str:
+    """Return a file:// URL for a bundled KaTeX asset."""
+    return local_file_url(KATEX_DIR / name)
+
+
+def math_inline_bracket(state: StateInline, silent: bool) -> bool:
+    """Parse inline math delimited by \\(...\\)."""
+    if state.src[state.pos : state.pos + 2] != "\\(":
+        return False
+
+    match = BRACKET_MATH_INLINE_RE.match(state.src, state.pos)
+    if not match:
+        return False
+
+    if not silent:
+        token = state.push("math_inline", "math", 0)
+        token.content = match.group(1)
+        token.markup = "\\("
+
+    state.pos = match.end()
+    return True
+
+
+def math_block_bracket(state: StateBlock, start_line: int, end_line: int, silent: bool) -> bool:
+    """Parse display math delimited by \\[...\\]."""
+    begin = state.bMarks[start_line] + state.tShift[start_line]
+    if state.src[begin : begin + 2] != "\\[":
+        return False
+
+    match = BRACKET_MATH_BLOCK_RE.match(state.src, begin)
+    if not match:
+        return False
+
+    if not silent:
+        token = state.push("math_block", "math", 0)
+        token.block = True
+        token.content = match.group(1)
+        token.markup = "\\["
+
+    end_pos = begin + match.end() - 1
+    line = start_line
+    while line < end_line:
+        if end_pos >= state.bMarks[line] and end_pos <= state.eMarks[line]:
+            state.line = line + 1
+            break
+        line += 1
+
+    return True
+
+
+def bracketmath_plugin(md: MarkdownIt) -> None:
+    """Parse LaTeX-style \\(...\\) and \\[...\\] math delimiters."""
+    md.inline.ruler.before("escape", "math_inline_bracket", math_inline_bracket)
+    md.block.ruler.before("fence", "math_block_bracket", math_block_bracket)
+
+
+def render_math(latex: str, options: dict[str, Any]) -> str:
+    """Return a KaTeX placeholder for inline or display math."""
+    display_mode = bool(options.get("display_mode"))
+    escaped = html.escape(latex.strip())
+    if display_mode:
+        return (
+            f'<div class="math-display" data-katex data-display="true">'
+            f"{escaped}</div>"
+        )
+    return (
+        f'<span class="math-inline" data-katex data-display="false">'
+        f"{escaped}</span>"
+    )
 
 
 def create_markdown_renderer() -> MarkdownIt:
-    """Create a Markdown renderer with HTML, tables, and code highlighting."""
+    """Create a Markdown renderer with HTML, tables, math, and code highlighting."""
     renderer = MarkdownIt(
         "default",
         {
@@ -240,6 +391,13 @@ def create_markdown_renderer() -> MarkdownIt:
         },
     )
     renderer.enable("table")
+    renderer.use(
+        dollarmath_plugin,
+        allow_space=True,
+        allow_digits=True,
+        renderer=render_math,
+    )
+    renderer.use(bracketmath_plugin)
     return renderer
 
 
@@ -248,40 +406,211 @@ def local_file_url(path: Path) -> str:
     return QUrl.fromLocalFile(str(path.resolve())).toString()
 
 
-def view_image_url(path: Path) -> str:
-    """Return a talknotes:// URL that opens an image in the in-app viewer."""
+def view_image_url(paths: list[Path], start: int = 0) -> str:
+    """Return a talknotes:// URL that opens images in the in-app viewer.
+
+    One path opens a single image; several paths open a gallery, showing
+    the image at index ``start`` first.
+    """
     url = QUrl("talknotes://view-image")
     query = QUrlQuery()
-    query.addQueryItem("file", str(path.resolve()))
+    if start:
+        query.addQueryItem("start", str(start))
+    for path in paths:
+        query.addQueryItem("file", str(path.resolve()))
     url.setQuery(query)
     return url.toString()
 
 
-def parse_view_image_path(url: QUrl) -> Path | None:
-    """Parse a talknotes://view-image URL into a local image path."""
-    file_value = QUrlQuery(url.query()).queryItemValue(
-        "file",
-        QUrl.ComponentFormattingOption.FullyDecoded,
-    )
-    if not file_value:
+def parse_view_image_start(url: QUrl) -> int:
+    """Return the index of the first image to show from a view-image URL."""
+    value = QUrlQuery(url.query()).queryItemValue("start")
+    return int(value) if value.isdigit() else 0
+
+
+def parse_view_image_paths(url: QUrl) -> list[Path]:
+    """Parse a talknotes://view-image URL into existing local image paths."""
+    paths: list[Path] = []
+    for key, value in QUrlQuery(url.query()).queryItems(
+        QUrl.ComponentFormattingOption.FullyDecoded
+    ):
+        if key != "file" or not value:
+            continue
+        if value.lower().startswith("file:"):
+            local_path = Path(QUrl(value).toLocalFile()).expanduser()
+        else:
+            local_path = Path(value).expanduser()
+        try:
+            resolved = local_path.resolve()
+        except OSError:
+            continue
+        if resolved.is_file() and resolved.suffix.lower() in IMAGE_EXTENSIONS:
+            paths.append(resolved)
+    return paths
+
+
+def natural_sort_key(path: Path) -> list[Any]:
+    """Sort key so that 'img2' comes before 'img10'."""
+    return [
+        (0, int(part)) if part.isdigit() else (1, part.lower())
+        for part in re.split(r"(\d+)", path.name)
+    ]
+
+
+def images_in_directory(directory: Path) -> list[Path]:
+    """Return the images in a folder, in natural filename order."""
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return []
+    images = [
+        entry.resolve()
+        for entry in entries
+        if entry.is_file()
+        and not entry.name.startswith(".")
+        and entry.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+    return sorted(images, key=natural_sort_key)
+
+
+def parse_gallery_href(href: str, markdown_dir: Path) -> list[Path] | None:
+    """Parse a gallery: href into image paths.
+
+    Items are separated by spaces (quote names that contain spaces) and are
+    resolved relative to the markdown file. An item naming a folder adds all
+    images in that folder. Returns None if the href is not a gallery link.
+    """
+    href = unquote(html.unescape(href.strip()))
+    if not href.lower().startswith(GALLERY_HREF_PREFIX):
         return None
 
-    if file_value.lower().startswith("file:"):
-        local_path = Path(QUrl(file_value).toLocalFile()).expanduser()
-    else:
-        local_path = Path(file_value).expanduser()
+    spec = href[len(GALLERY_HREF_PREFIX) :].strip()
+    try:
+        items = shlex.split(spec)
+    except ValueError:
+        items = spec.split()
+
+    images: list[Path] = []
+    for item in items:
+        path = resolve_href_path(item, markdown_dir)
+        if path is None:
+            continue
+        if path.is_dir():
+            images.extend(images_in_directory(path))
+        elif path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            images.append(path)
+    return images
+
+
+def parse_run_href(href: str, markdown_dir: Path) -> list[str] | None:
+    """Parse a run: href into argv for subprocess."""
+    href = unquote(href.strip())
+    if not href.lower().startswith(RUN_HREF_PREFIX):
+        return None
+
+    cmd = href[len(RUN_HREF_PREFIX) :].strip()
+    if not cmd:
+        return None
 
     try:
-        resolved = local_path.resolve()
-    except OSError:
+        argv = shlex.split(cmd)
+    except ValueError:
         return None
 
-    return resolved if resolved.is_file() else None
+    if not argv:
+        return None
+
+    return resolve_run_argv_paths(argv, markdown_dir)
 
 
-def image_viewer_settings_prefix(path: Path) -> str:
-    """Return a stable QSettings prefix for one image viewer window."""
-    digest = hashlib.sha256(str(path.resolve()).encode()).hexdigest()
+def resolve_run_argv_paths(argv: list[str], markdown_dir: Path) -> list[str]:
+    """Resolve relative file paths in a run command."""
+    resolved: list[str] = []
+    for arg in argv:
+        if arg.startswith("-"):
+            resolved.append(arg)
+            continue
+
+        if arg.startswith("~"):
+            resolved.append(str(Path(arg).expanduser()))
+            continue
+
+        path = Path(arg)
+        if not path.is_absolute():
+            candidate = (markdown_dir / path).resolve()
+            if candidate.is_file():
+                resolved.append(str(candidate))
+                continue
+
+        resolved.append(arg)
+
+    return resolved
+
+
+def run_command_url(argv: list[str]) -> str:
+    """Return a talknotes:// URL that launches a command when clicked."""
+    url = QUrl("talknotes://run")
+    query = QUrlQuery()
+    for arg in argv:
+        query.addQueryItem("arg", arg)
+    url.setQuery(query)
+    return url.toString()
+
+
+def parse_run_command(url: QUrl) -> list[str] | None:
+    """Parse a talknotes://run URL into argv."""
+    argv = [
+        value
+        for key, value in QUrlQuery(url.query()).queryItems(
+            QUrl.ComponentFormattingOption.FullyDecoded
+        )
+        if key == "arg"
+    ]
+    return argv or None
+
+
+def normalize_run_argv(argv: list[str]) -> list[str]:
+    """Recover argv when a run link was stored as one shell-style string."""
+    if len(argv) != 1:
+        return argv
+
+    command = unquote(argv[0]).strip()
+    if " " not in command and "%20" not in argv[0]:
+        return argv
+
+    try:
+        split_argv = shlex.split(command)
+    except ValueError:
+        return argv
+
+    return split_argv or argv
+
+
+def launch_run_command(argv: list[str]) -> None:
+    """Launch a command in the background without a shell."""
+    argv = normalize_run_argv(argv)
+    if argv and argv[0] in ("python", "python3"):
+        argv = [sys.executable, *argv[1:]]
+    cwd: Path | None = None
+    for arg in reversed(argv):
+        if arg.startswith("-"):
+            continue
+        path = Path(arg).expanduser()
+        if path.suffix.lower() == ".py" and path.is_file():
+            cwd = path.parent.resolve()
+            break
+
+    subprocess.Popen(
+        argv,
+        cwd=str(cwd) if cwd is not None else None,
+        start_new_session=True,
+    )
+
+
+def image_viewer_settings_prefix(paths: list[Path]) -> str:
+    """Return a stable QSettings prefix for one image or gallery viewer window."""
+    key = "\n".join(str(path.resolve()) for path in paths)
+    digest = hashlib.sha256(key.encode()).hexdigest()
     return f"image_viewer/{digest}"
 
 
@@ -291,7 +620,7 @@ def window_geometry_prefix(markdown_path: Path, screen_size: QSize) -> str:
     return f"window_geometry/{digest}/{screen_size.width()}x{screen_size.height()}"
 
 
-def screen_for_window_geometry(window: QMainWindow | None = None):
+def screen_for_window_geometry(window: QWidget | None = None):
     """Screen that contains the window, else the screen under the cursor, else primary."""
     if window is not None:
         screen = QApplication.screenAt(window.frameGeometry().center())
@@ -300,9 +629,9 @@ def screen_for_window_geometry(window: QMainWindow | None = None):
     return QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
 
 
-def resolve_local_path(href: str, markdown_dir: Path) -> Path | None:
-    """Resolve a markdown href/src to an existing local file, or None."""
-    href = href.strip()
+def resolve_href_path(href: str, markdown_dir: Path) -> Path | None:
+    """Resolve a markdown href/src to an absolute local path (may not exist)."""
+    href = unquote(html.unescape(href.strip()))
     if not href or href.lower().startswith(EXTERNAL_HREF_PREFIXES):
         return None
 
@@ -314,24 +643,100 @@ def resolve_local_path(href: str, markdown_dir: Path) -> Path | None:
             local_path = markdown_dir / local_path
 
     try:
-        resolved = local_path.resolve()
+        return local_path.resolve()
     except OSError:
         return None
 
-    return resolved if resolved.is_file() else None
+
+def resolve_local_path(href: str, markdown_dir: Path) -> Path | None:
+    """Resolve a markdown href/src to an existing local file, or None."""
+    path = resolve_href_path(href, markdown_dir)
+    return path if path is not None and path.is_file() else None
+
+
+def resolve_local_dir(href: str, markdown_dir: Path) -> Path | None:
+    """Resolve a markdown href to an existing local folder, or None."""
+    path = resolve_href_path(href, markdown_dir)
+    return path if path is not None and path.is_dir() else None
+
+
+def resolve_gallery_href(href: str, markdown_dir: Path) -> list[Path] | None:
+    """Return the images of a gallery: link or a link to a folder of images.
+
+    Returns None if the href is neither (an empty list if it is a gallery
+    link whose items match no images).
+    """
+    gallery = parse_gallery_href(href, markdown_dir)
+    if gallery is not None:
+        return gallery
+    directory = resolve_local_dir(href, markdown_dir)
+    if directory is not None:
+        images = images_in_directory(directory)
+        return images or None
+    return None
 
 
 def link_local_files(body_html: str, markdown_dir: Path) -> str:
-    """Rewrite local hrefs and wrap non-image file images in clickable links."""
+    """Rewrite local hrefs and make local images open in the in-app viewer.
+
+    Both embedded images (``![](pic.jpg)``) and plain links to image files
+    (``[label](pic.webp)``) open in an ImageViewerWindow instead of the
+    system default app. Links to a folder of images (``[label](photos/)``)
+    and ``gallery:`` links (``[label](<gallery: a.jpg b.webp>)``) open a
+    gallery that is browsed with the arrow keys.
+
+    An image wrapped in a gallery link (``[![](a.jpg)](<gallery: b.jpg c.jpg>)``)
+    is shown on the slide with a "+N" badge for the other images; clicking it
+    opens the gallery at that image (it is added first if not in the list).
+    """
+    def rewrite_image_anchor(match: re.Match[str]) -> str:
+        href = match.group(1) if match.group(1) is not None else match.group(2)
+        img_tag = match.group(3)
+        gallery = resolve_gallery_href(href, markdown_dir)
+        if not gallery:
+            return match.group(0)
+
+        src_match = HTML_IMG_TAG.match(img_tag)
+        shown = resolve_local_path(src_match.group(2), markdown_dir) if src_match else None
+        start = 0
+        if shown is not None and shown.suffix.lower() in IMAGE_EXTENSIONS:
+            if shown in gallery:
+                start = gallery.index(shown)
+            else:
+                gallery = [shown, *gallery]
+        others = len(gallery) - 1 if shown in gallery else len(gallery)
+
+        gallery_href = html.escape(view_image_url(gallery, start), quote=True)
+        badge = f'<span class="gallery-badge">+{others}</span>' if others > 0 else ""
+        return (
+            f'<a href="{gallery_href}" class="image-link gallery-link">'
+            f'<span class="gallery-thumb">{img_tag}{badge}</span></a>'
+        )
+
     def rewrite_anchor(match: re.Match[str]) -> str:
         prefix, quote, href = match.group(1), match.group(2), match.group(3)
         if href.lower().startswith(
             ("talknotes:", "http://", "https://", "mailto:", "javascript:", "#")
         ):
             return match.group(0)
+        gallery = resolve_gallery_href(href, markdown_dir)
+        if gallery is not None:
+            if not gallery:
+                return match.group(0)
+            gallery_href = html.escape(view_image_url(gallery), quote=True)
+            return f"{prefix}{quote}{gallery_href}{quote}"
+        run_argv = parse_run_href(href, markdown_dir)
+        if run_argv is not None:
+            run_href = html.escape(run_command_url(run_argv), quote=True)
+            return f'{prefix}{quote}{run_href}{quote} class="run-link"'
+        directory = resolve_local_dir(href, markdown_dir)
+        if directory is not None:
+            return f"{prefix}{quote}{html.escape(local_file_url(directory), quote=True)}{quote}"
         path = resolve_local_path(href, markdown_dir)
         if path is None:
             return match.group(0)
+        if path.suffix.lower() in IMAGE_EXTENSIONS:
+            return f"{prefix}{quote}{html.escape(view_image_url([path]), quote=True)}{quote}"
         return f"{prefix}{quote}{html.escape(local_file_url(path), quote=True)}{quote}"
 
     def wrap_image(match: re.Match[str]) -> str:
@@ -340,12 +745,24 @@ def link_local_files(body_html: str, markdown_dir: Path) -> str:
         if path is None:
             return img_tag
         if path.suffix.lower() in IMAGE_EXTENSIONS:
-            href = html.escape(view_image_url(path), quote=True)
+            href = html.escape(view_image_url([path]), quote=True)
             return f'<a href="{href}" class="image-link">{img_tag}</a>'
         file_href = html.escape(local_file_url(path), quote=True)
         return f'<a href="{file_href}" class="local-file-link">{img_tag}</a>'
 
-    body_html = HTML_IMG_TAG.sub(wrap_image, body_html)
+    def wrap_images_outside_anchors(html_text: str) -> str:
+        # Images already inside a link keep that link (no nested anchors).
+        pieces: list[str] = []
+        last = 0
+        for anchor in HTML_ANCHOR_ELEMENT.finditer(html_text):
+            pieces.append(HTML_IMG_TAG.sub(wrap_image, html_text[last : anchor.start()]))
+            pieces.append(anchor.group(0))
+            last = anchor.end()
+        pieces.append(HTML_IMG_TAG.sub(wrap_image, html_text[last:]))
+        return "".join(pieces)
+
+    body_html = HTML_IMAGE_ANCHOR.sub(rewrite_image_anchor, body_html)
+    body_html = wrap_images_outside_anchors(body_html)
     return HTML_A_HREF.sub(rewrite_anchor, body_html)
 
 
@@ -358,11 +775,12 @@ TALKNOTES_SHORTCUTS: list[tuple[str, str]] = [
     ("t", "toggle window frame / title bar"),
     ("p", "toggle page numbers"),
     ("d", "toggle dark mode"),
-    ("r", "reload markdown file"),
+    ("r / R", "reload markdown file"),
     ("c", "copy all quoted markdown"),
-    ("m + 1–9", "copy i-th quoted block"),
+    ("m + 1–9", "copy i-th quoted or code block"),
     ("e", "open markdown in default editor"),
-    ("click image", "open image in movable, resizable window"),
+    ("click image / image link", "open image in window (drag moves, click or Esc closes)"),
+    ("← / → in image window", "previous / next image of a gallery link"),
     ("[ / ]", "decrease / increase quoted text size"),
     ("h / ? / Escape", "show / hide this help"),
 ]
@@ -418,14 +836,19 @@ def render_slide_html(
             f"</footer>"
         )
     help_overlay = render_help_overlay_html() if show_help else ""
+    katex_css = html.escape(katex_asset_url("katex.min.css"), quote=True)
+    katex_js = html.escape(katex_asset_url("katex.min.js"), quote=True)
 
     theme_class = "dark" if dark_mode else "light"
     return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
+  <link rel="stylesheet" href="{katex_css}">
+  <script src="{katex_js}"></script>
   <style>
-    {HtmlFormatter().get_style_defs(".highlight")}
+    {HtmlFormatter(style="default").get_style_defs(".highlight")}
+    {HtmlFormatter(style="github-dark").get_style_defs("body.dark .highlight")}
 
     :root {{
       color-scheme: light dark;
@@ -523,6 +946,7 @@ def render_slide_html(
     }}
 
     a.local-file-link,
+    a.run-link,
     a.image-link {{
       cursor: pointer;
       display: block;
@@ -531,6 +955,35 @@ def render_slide_html(
     a.local-file-link img,
     a.image-link img {{
       margin: 1em auto;
+    }}
+
+    a.gallery-link {{
+      text-align: center;
+    }}
+
+    .gallery-thumb {{
+      display: inline-block;
+      margin: 1em auto;
+      max-width: 100%;
+      position: relative;
+    }}
+
+    a.gallery-link .gallery-thumb img {{
+      margin: 0;
+    }}
+
+    .gallery-badge {{
+      background: rgba(0, 0, 0, 0.62);
+      border-radius: 999px;
+      bottom: 0.45em;
+      color: #fff;
+      font-size: 0.55em;
+      font-weight: 600;
+      line-height: 1;
+      padding: 0.3em 0.6em;
+      pointer-events: none;
+      position: absolute;
+      right: 0.45em;
     }}
 
     table {{
@@ -592,6 +1045,20 @@ def render_slide_html(
 
     body.dark .code-block {{
       background: #1b1f27;
+    }}
+
+    .math-display {{
+      margin: 0.9em 0;
+      overflow-x: auto;
+      text-align: center;
+    }}
+
+    .math-inline {{
+      white-space: nowrap;
+    }}
+
+    body.dark .katex {{
+      color: inherit;
     }}
 
     .slide-footer {{
@@ -733,6 +1200,14 @@ def render_slide_html(
   </main>
   {footer}
   {help_overlay}
+  <script>
+    document.querySelectorAll("[data-katex]").forEach(function (el) {{
+      katex.render(el.textContent, el, {{
+        displayMode: el.getAttribute("data-display") === "true",
+        throwOnError: false,
+      }});
+    }});
+  </script>
 </body>
 </html>"""
 
@@ -811,12 +1286,35 @@ def load_image_pixmap(path: Path) -> QPixmap:
         painter.end()
         return pixmap
 
-    pixmap = QPixmap(str(path))
-    if not pixmap.isNull():
-        return pixmap
+    # Detect the format from file contents (a mislabelled .webp/.jpg still loads)
+    # and honour EXIF orientation, as browsers do in the slide view.
+    reader = QImageReader(str(path))
+    reader.setDecideFormatFromContent(True)
+    reader.setAutoTransform(True)
+    image = reader.read()
+    if not image.isNull():
+        return QPixmap.fromImage(image)
 
-    image = QImageReader(str(path)).read()
-    return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+    return load_image_pixmap_via_sips(path)
+
+
+def load_image_pixmap_via_sips(path: Path) -> QPixmap:
+    """Decode an image with macOS `sips` when Qt lacks a plugin (e.g. WebP)."""
+    if sys.platform != "darwin":
+        return QPixmap()
+
+    with tempfile.TemporaryDirectory(prefix="talknotes-") as tmp_dir:
+        png_path = Path(tmp_dir) / "image.png"
+        try:
+            subprocess.run(
+                ["sips", "-s", "format", "png", str(path), "--out", str(png_path)],
+                check=True,
+                capture_output=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return QPixmap()
+        return QPixmap(str(png_path))
 
 
 def image_display_size(image_path: Path) -> QSize:
@@ -827,10 +1325,10 @@ def image_display_size(image_path: Path) -> QSize:
     return fit_size_to_screen(pixmap.size())
 
 
-def load_saved_image_viewer_geometry(image_path: Path) -> QRect | None:
+def load_saved_image_viewer_geometry(image_paths: list[Path]) -> QRect | None:
     """Return saved outer geometry for an image viewer, if it looks usable."""
     settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
-    prefix = image_viewer_settings_prefix(image_path)
+    prefix = image_viewer_settings_prefix(image_paths)
     x = settings.value(f"{prefix}/x", type=int)
     y = settings.value(f"{prefix}/y", type=int)
     width = settings.value(f"{prefix}/width", type=int)
@@ -844,7 +1342,7 @@ def load_saved_image_viewer_geometry(image_path: Path) -> QRect | None:
     return outer
 
 
-def center_window_on_screen(window: QMainWindow, client_size: QSize) -> None:
+def center_window_on_screen(window: QWidget, client_size: QSize) -> None:
     """Resize the client area and center the window on the primary screen."""
     window.resize(client_size)
     screen = QApplication.primaryScreen()
@@ -872,24 +1370,26 @@ def center_window_on_screen(window: QMainWindow, client_size: QSize) -> None:
     )
 
 
-def apply_default_image_viewer_geometry(window: QMainWindow, image_path: Path) -> None:
-    """Size a viewer window to the image and center it on screen."""
-    center_window_on_screen(window, image_display_size(image_path))
+def apply_default_image_viewer_geometry(window: QWidget, first_image: Path) -> None:
+    """Size a viewer window to the first image shown and center it on screen."""
+    center_window_on_screen(window, image_display_size(first_image))
 
 
-def apply_image_viewer_geometry(window: QMainWindow, image_path: Path) -> None:
+def apply_image_viewer_geometry(
+    window: QWidget, image_paths: list[Path], first_index: int = 0
+) -> None:
     """Restore saved viewer geometry or apply a default image-sized layout."""
-    saved = load_saved_image_viewer_geometry(image_path)
+    saved = load_saved_image_viewer_geometry(image_paths)
     if saved is not None:
         set_frame_geometry(window, clamp_geometry_to_screen(saved))
         return
-    apply_default_image_viewer_geometry(window, image_path)
+    apply_default_image_viewer_geometry(window, image_paths[first_index])
 
 
-def save_image_viewer_geometry(window: QMainWindow, image_path: Path) -> None:
+def save_image_viewer_geometry(window: QWidget, image_paths: list[Path]) -> None:
     """Persist an image viewer window's outer geometry."""
     settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
-    prefix = image_viewer_settings_prefix(image_path)
+    prefix = image_viewer_settings_prefix(image_paths)
     outer = window.frameGeometry()
     settings.setValue(f"{prefix}/x", outer.x())
     settings.setValue(f"{prefix}/y", outer.y())
@@ -897,7 +1397,7 @@ def save_image_viewer_geometry(window: QMainWindow, image_path: Path) -> None:
     settings.setValue(f"{prefix}/height", outer.height())
 
 
-def set_frame_geometry(window: QMainWindow, outer: QRect) -> None:
+def set_frame_geometry(window: QWidget, outer: QRect) -> None:
     """Set a top-level window's outer bounds (PySide6 lacks setFrameGeometry)."""
     window.setGeometry(outer)
     frame = window.frameGeometry()
@@ -982,70 +1482,268 @@ def save_window_settings(window: TalknotesWindow) -> None:
     settings.setValue(f"{prefix}/height", outer.height())
 
 
-class ImageViewerWindow(QMainWindow):
-    """Framed window for viewing a single slide image."""
+def image_viewer_window_flags() -> Qt.WindowType:
+    """Window flags for a native, resizable window without a title bar.
 
-    def __init__(self, image_path: Path) -> None:
-        super().__init__(None, Qt.WindowType.Window)
+    On macOS (Qt >= 6.9) this keeps the system frame -- rounded corners,
+    shadow, resizable edges -- but lets the content fill the title-bar area,
+    and omits the title text and the close/minimize/zoom buttons.
+    """
+    flags = (
+        Qt.WindowType.Window
+        | Qt.WindowType.CustomizeWindowHint
+        | Qt.WindowType.WindowTitleHint
+    )
+    expanded = getattr(Qt.WindowType, "ExpandedClientAreaHint", None)
+    no_title_background = getattr(Qt.WindowType, "NoTitleBarBackgroundHint", None)
+    if expanded is not None and no_title_background is not None:
+        flags |= expanded | no_title_background
+    return flags
+
+
+class ImageViewerWindow(QWidget):
+    """Title-less, resizable window showing one image or a gallery of images.
+
+    Drag anywhere to move the window, drag its edges to resize, and click
+    (without dragging) or press Escape to close it. In a gallery, Left/Right
+    (or PageUp/PageDown, as sent by presentation remotes) show the
+    previous/next image, Up/Home the first, and Down/End the last.
+    """
+
+    BACKGROUND = QColor(24, 24, 24)
+    COUNTER_DURATION_MS = 1500
+
+    def __init__(self, image_paths: list[Path], start: int = 0) -> None:
+        super().__init__(None, image_viewer_window_flags())
+        if not image_paths:
+            raise ValueError("ImageViewerWindow needs at least one image")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.image_path = image_path.resolve()
-        self._source_pixmap = load_image_pixmap(self.image_path)
-
-        self._label = QLabel()
-        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._label.setSizePolicy(
-            QSizePolicy.Policy.Ignored,
-            QSizePolicy.Policy.Ignored,
-        )
-
-        scroll = QScrollArea()
-        scroll.setWidget(self._label)
-        scroll.setWidgetResizable(True)
-        scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        self.setCentralWidget(scroll)
-
-        self.setWindowTitle(self.image_path.name)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self.image_paths = [path.resolve() for path in image_paths]
+        self._index = max(0, min(start, len(self.image_paths) - 1))
+        self._pixmap_cache: dict[int, QPixmap] = {}
+        self._source_pixmap = self._load_pixmap(self._index)
+        self._scaled_pixmap = QPixmap()
+        self._scaled_ratio = 0.0
         self._geometry_applied = False
+
+        self._press_global_pos: QPoint | None = None
+        self._dragging = False
+        self._manual_drag_offset: QPoint | None = None
+
+        self._counter_visible = False
+        self._counter_timer = QTimer(self)
+        self._counter_timer.setSingleShot(True)
+        self._counter_timer.setInterval(self.COUNTER_DURATION_MS)
+        self._counter_timer.timeout.connect(self._hide_counter)
+
+        # macOS would draw a non-empty title on top of the image.
+        self.setWindowTitle("")
+        self.setMinimumSize(120, 120)
 
         shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         shortcut.activated.connect(self.close)
 
+    @property
+    def image_path(self) -> Path:
+        """Path of the image currently shown."""
+        return self.image_paths[self._index]
+
+    @property
+    def is_gallery(self) -> bool:
+        return len(self.image_paths) > 1
+
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
         if not self._geometry_applied:
             self._geometry_applied = True
-            apply_image_viewer_geometry(self, self.image_path)
-        self._update_scaled_pixmap()
+            apply_image_viewer_geometry(self, self.image_paths, self._index)
+            self._flash_counter()
+            QTimer.singleShot(0, self._preload_neighbours)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        self._update_scaled_pixmap()
+        self._scaled_pixmap = QPixmap()
+        self.update()
 
-    def _update_scaled_pixmap(self) -> None:
+    # -- gallery navigation ------------------------------------------------
+
+    def show_image(self, index: int) -> None:
+        """Switch to the image at index (clamped to the gallery)."""
+        index = max(0, min(index, len(self.image_paths) - 1))
+        if index == self._index:
+            return
+        self._index = index
+        self._source_pixmap = self._load_pixmap(index)
+        self._scaled_pixmap = QPixmap()
+        self._flash_counter()
+        self.update()
+        QTimer.singleShot(0, self._preload_neighbours)
+
+    def next_image(self) -> None:
+        self.show_image(self._index + 1)
+
+    def previous_image(self) -> None:
+        self.show_image(self._index - 1)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        key = event.key()
+        if key in (Qt.Key.Key_Right, Qt.Key.Key_PageDown):
+            self.next_image()
+        elif key in (Qt.Key.Key_Left, Qt.Key.Key_PageUp):
+            self.previous_image()
+        elif key in (Qt.Key.Key_Up, Qt.Key.Key_Home):
+            self.show_image(0)
+        elif key in (Qt.Key.Key_Down, Qt.Key.Key_End):
+            self.show_image(len(self.image_paths) - 1)
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+
+    def _load_pixmap(self, index: int) -> QPixmap:
+        pixmap = self._pixmap_cache.get(index)
+        if pixmap is None:
+            pixmap = load_image_pixmap(self.image_paths[index])
+            self._pixmap_cache[index] = pixmap
+        return pixmap
+
+    def _preload_neighbours(self) -> None:
+        """Decode the adjacent images ahead of time; drop the rest from memory."""
+        keep = {
+            i
+            for i in (self._index - 1, self._index, self._index + 1)
+            if 0 <= i < len(self.image_paths)
+        }
+        for index in list(self._pixmap_cache):
+            if index not in keep:
+                del self._pixmap_cache[index]
+        for index in keep:
+            self._load_pixmap(index)
+
+    def _flash_counter(self) -> None:
+        if not self.is_gallery:
+            return
+        self._counter_visible = True
+        self._counter_timer.start()
+        self.update()
+
+    def _hide_counter(self) -> None:
+        self._counter_visible = False
+        self.update()
+
+    # -- painting ----------------------------------------------------------
+
+    def _scaled_for_window(self) -> QPixmap:
+        """Return the image scaled to fit the window, at device-pixel resolution."""
+        ratio = self.devicePixelRatioF()
+        if self._scaled_pixmap.isNull() or self._scaled_ratio != ratio:
+            self._scaled_pixmap = self._source_pixmap.scaled(
+                self.size() * ratio,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._scaled_pixmap.setDevicePixelRatio(ratio)
+            self._scaled_ratio = ratio
+        return self._scaled_pixmap
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), self.BACKGROUND)
         if self._source_pixmap.isNull():
-            self._label.setText(f"Could not load image:\n{self.image_path.name}")
-            self._label.setPixmap(QPixmap())
-            return
+            painter.setPen(QColor(220, 220, 220))
+            painter.drawText(
+                self.rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                f"Could not load image:\n{self.image_path.name}",
+            )
+        else:
+            pixmap = self._scaled_for_window()
+            size = pixmap.deviceIndependentSize().toSize()
+            x = (self.width() - size.width()) // 2
+            y = (self.height() - size.height()) // 2
+            painter.drawPixmap(x, y, pixmap)
 
-        viewport = self.centralWidget()
-        if not isinstance(viewport, QScrollArea):
-            return
+        if self._counter_visible:
+            self._paint_counter(painter)
 
-        available = viewport.viewport().size()
-        if available.width() <= 0 or available.height() <= 0:
-            return
-
-        scaled = self._source_pixmap.scaled(
-            available,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+    def _paint_counter(self, painter: QPainter) -> None:
+        """Draw a small 'i / n' badge in the bottom-right corner."""
+        text = f"{self._index + 1} / {len(self.image_paths)}"
+        font = painter.font()
+        font.setPointSizeF(13)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        pad_x, pad_y, margin = 10, 5, 12
+        width = metrics.horizontalAdvance(text) + 2 * pad_x
+        height = metrics.height() + 2 * pad_y
+        badge = QRect(
+            self.width() - width - margin,
+            self.height() - height - margin,
+            width,
+            height,
         )
-        self._label.setPixmap(scaled)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 160))
+        painter.drawRoundedRect(badge, height / 2, height / 2)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
+
+    # -- mouse: drag moves, click closes -----------------------------------
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        self._press_global_pos = event.globalPosition().toPoint()
+        self._dragging = False
+        self._manual_drag_offset = None
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._press_global_pos is None or not (
+            event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            super().mouseMoveEvent(event)
+            return
+
+        global_pos = event.globalPosition().toPoint()
+        if not self._dragging:
+            moved = (global_pos - self._press_global_pos).manhattanLength()
+            if moved < QApplication.startDragDistance():
+                event.accept()
+                return
+            self._dragging = True
+            handle = self.windowHandle()
+            if handle is not None and handle.startSystemMove():
+                # The window system now owns the drag (and its mouse release).
+                event.accept()
+                return
+            self._manual_drag_offset = (
+                self._press_global_pos - self.frameGeometry().topLeft()
+            )
+
+        if self._manual_drag_offset is not None:
+            self.move(global_pos - self._manual_drag_offset)
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+        was_click = self._press_global_pos is not None and not self._dragging
+        self._press_global_pos = None
+        self._dragging = False
+        self._manual_drag_offset = None
+        event.accept()
+        if was_click:
+            self.close()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        save_image_viewer_geometry(self, self.image_path)
+        save_image_viewer_geometry(self, self.image_paths)
         super().closeEvent(event)
 
 
@@ -1077,12 +1775,15 @@ class TalknotesWebPage(QWebEnginePage):
             elif action == "close-help":
                 self._window.close_help()
             elif action == "view-image":
-                image_path = parse_view_image_path(url)
-                if (
-                    image_path is not None
-                    and image_path.suffix.lower() in IMAGE_EXTENSIONS
-                ):
-                    self._window.open_image_viewer(image_path)
+                image_paths = parse_view_image_paths(url)
+                if image_paths:
+                    self._window.open_image_viewer(
+                        image_paths, parse_view_image_start(url)
+                    )
+            elif action == "run":
+                argv = parse_run_command(url)
+                if argv is not None:
+                    self._window.run_command(argv)
             return False
 
         if scheme in ("http", "https", "mailto", "file"):
@@ -1105,11 +1806,8 @@ class TalknotesWebView(QWebEngineView):
         self._window = window
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if self._window._handle_quote_font_shortcut(event):
+        if self._window._route_key_press(event):
             event.accept()
-            return
-        self._window.handle_key_press(event)
-        if event.isAccepted():
             return
         super().keyPressEvent(event)
 
@@ -1245,6 +1943,23 @@ class TalknotesWindow(QMainWindow):
     def _is_increase_quote_ratio_key(self, event: QKeyEvent) -> bool:
         return event.key() == Qt.Key_BracketRight or event.text() == "]"
 
+    def _is_reload_shortcut(self, event: QKeyEvent) -> bool:
+        modifiers = event.modifiers()
+        if modifiers & (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.MetaModifier
+            | Qt.KeyboardModifier.AltModifier
+        ):
+            return False
+        return event.key() == Qt.Key.Key_R or event.text().lower() == "r"
+
+    def _route_key_press(self, event: QKeyEvent) -> bool:
+        """Handle talknotes shortcuts; return True if the event was consumed."""
+        if self._handle_quote_font_shortcut(event):
+            return True
+        self.handle_key_press(event)
+        return event.isAccepted()
+
     def _handle_quote_font_shortcut(self, event: QKeyEvent) -> bool:
         if not (
             self._is_decrease_quote_ratio_key(event)
@@ -1283,22 +1998,14 @@ class TalknotesWindow(QMainWindow):
             elif event.type() == QEvent.Type.MouseButtonRelease:
                 if isinstance(event, QMouseEvent) and self._end_window_move(event):
                     return True
-            elif (
-                self.show_help
-                and event.type() == QEvent.Type.KeyPress
-                and isinstance(event, QKeyEvent)
-            ):
-                self.handle_key_press(event)
-                event.accept()
-                return True
-        elif is_web_view and event.type() == QEvent.Type.KeyPress:
-            if isinstance(event, QKeyEvent):
-                if self._handle_quote_font_shortcut(event):
+            elif event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+                if self._route_key_press(event):
                     event.accept()
                     return True
-                self.handle_key_press(event)
-                if event.isAccepted():
-                    return True
+        elif is_web_view and event.type() == QEvent.Type.KeyPress:
+            if isinstance(event, QKeyEvent) and self._route_key_press(event):
+                event.accept()
+                return True
 
         return super().eventFilter(watched, event)
 
@@ -1355,24 +2062,29 @@ class TalknotesWindow(QMainWindow):
             geometry.height(),
         )
 
-    def open_image_viewer(self, path: Path) -> None:
-        """Open or focus a framed viewer window for a local image file."""
-        resolved = path.resolve()
-        key = str(resolved)
+    def open_image_viewer(self, paths: list[Path], start: int = 0) -> None:
+        """Open or focus a title-less viewer for an image or a gallery."""
+        resolved = [path.resolve() for path in paths]
+        key = "\n".join(str(path) for path in resolved)
         existing = self._image_viewers.get(key)
         if existing is not None:
             if existing.isVisible():
+                existing.show_image(start)
                 existing.raise_()
                 existing.activateWindow()
                 return
             self._image_viewers.pop(key, None)
 
-        viewer = ImageViewerWindow(resolved)
+        viewer = ImageViewerWindow(resolved, start)
         viewer.destroyed.connect(lambda *_args, image_key=key: self._image_viewers.pop(image_key, None))
         self._image_viewers[key] = viewer
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
+
+    def run_command(self, argv: list[str]) -> None:
+        """Launch a command linked from the current slide."""
+        launch_run_command(argv)
 
     def go_to_slide(self, index: int) -> None:
         clamped_index = max(0, min(index, len(self.slides) - 1))
@@ -1416,8 +2128,8 @@ class TalknotesWindow(QMainWindow):
             return
         QApplication.clipboard().setText(quoted)
 
-    def copy_quoted_text_by_index(self, index: int) -> None:
-        quoted = extract_nth_quoted_text(self.slides[self.current_index], index)
+    def copy_block_by_index(self, index: int) -> None:
+        quoted = extract_nth_copyable_block(self.slides[self.current_index], index)
         if quoted is None:
             return
         QApplication.clipboard().setText(quoted)
@@ -1466,7 +2178,7 @@ class TalknotesWindow(QMainWindow):
 
         if self.quote_copy_pending:
             if modifiers in (Qt.NoModifier, Qt.KeypadModifier) and Qt.Key_1 <= key <= Qt.Key_9:
-                self.copy_quoted_text_by_index(key - Qt.Key_0)
+                self.copy_block_by_index(key - Qt.Key_0)
                 self.quote_copy_pending = False
                 event.accept()
                 return
@@ -1494,7 +2206,7 @@ class TalknotesWindow(QMainWindow):
         elif key == Qt.Key_P:
             self.show_page_numbers = not self.show_page_numbers
             self.render_current_slide()
-        elif key == Qt.Key_R:
+        elif self._is_reload_shortcut(event):
             self.reload_markdown()
         elif key == Qt.Key_C:
             self.copy_quoted_text()
@@ -1517,10 +2229,10 @@ class TalknotesWindow(QMainWindow):
         event.accept()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if self._handle_quote_font_shortcut(event):
+        if self._route_key_press(event):
             event.accept()
             return
-        self.handle_key_press(event)
+        super().keyPressEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         for viewer in list(self._image_viewers.values()):
@@ -1543,7 +2255,7 @@ def start_global_hotkeys(window: TalknotesWindow) -> Any | None:
     if pynput_keyboard is None:
         print(
             "Global hotkeys disabled: missing dependency pynput. Install it with:\n"
-            "  python -m pip install PySide6 markdown-it-py pygments pynput",
+            "  python -m pip install PySide6 markdown-it-py mdit-py-plugins pygments pynput",
             file=sys.stderr,
         )
         return None
